@@ -1,273 +1,251 @@
-from rest_framework import status, permissions
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated, AllowAny
-from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.parsers import MultiPartParser, FormParser
-from django.contrib.auth import login
-from django.utils.crypto import get_random_string
-from datetime import datetime
-import string
-import cv2
-import numpy as np
-from PIL import Image
-from django.utils import timezone
-
-from .models import User, Attendance
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.permissions import AllowAny
+from django.contrib.auth import authenticate
+from django.db.models import Count
+from .models import User, FaceEmbedding, Attendance, Class
 from .serializers import (
-    LoginSerializer, 
-    AttendanceCreateSerializer, 
-    AttendanceHistorySerializer,
-    LecturerAttendanceViewSerializer
+    LoginSerializer, FaceEnrollSerializer, CheckinSerializer, UserSerializer,
+    ClassSerializer, ClassListSerializer, AttendanceHistorySerializer,
+    AttendanceRecapSerializer
 )
+from .authentication import generate_token
+from .face_utils import extract_embedding, enroll_with_multiple_images, verify_face
 
-def generate_token():
-    """Generate a simple token for authentication"""
-    return get_random_string(32)
+class LoginView(APIView):
+    permission_classes = [AllowAny]
 
-class LoginAPIView(APIView):
-    """Handle user login"""
-    permission_classes = [permissions.AllowAny]
-    
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
         if serializer.is_valid():
-            user = serializer.validated_data['user']
-            
-            # Generate token (in production, use proper JWT tokens)
-            token = generate_token()
-            
-            # Store token and creation time
-            user.token = token
-            user.token_created = timezone.now()
-            user.save()
-            
-            # Determine navigation screen based on user role
-            if user.role == 'mahasiswa':
-                navigation_screen = 'mahasiswa_screen'
-            elif user.role == 'dosen':
-                navigation_screen = 'dosen_screen'
-            else:
-                navigation_screen = 'mahasiswa_screen'  # Default fallback
-            
-            response_data = {
-                "success": True,
-                "message": "Login berhasil",
-                "data": {
-                    "id": user.id,
-                    "nama": user.first_name or user.username,
-                    "role": user.role,
-                    "token": token,
-                    "navigation_screen": navigation_screen
-                }
-            }
-            
-            return Response(response_data, status=status.HTTP_200_OK)
-        else:
-            return Response({
-                "success": False,
-                "message": "User tidak ditemukan"
-            }, status=status.HTTP_400_BAD_REQUEST)
+            username = serializer.validated_data['username']
+            password = serializer.validated_data['password']
 
-class AttendanceAPIView(APIView):
-    """Handle student attendance"""
-    permission_classes = [IsAuthenticated]
-    
+            try:
+                user = User.objects.get(username=username)
+                if user.check_password(password):
+                    token = generate_token(user)
+                    return Response({
+                        'status': True,
+                        'message': 'Login berhasil',
+                        'data': UserSerializer(user).data,
+                        'token': token
+                    })
+                else:
+                    return Response({
+                        'status': False,
+                        'message': 'Password salah'
+                    }, status=status.HTTP_401_UNAUTHORIZED)
+            except User.DoesNotExist:
+                return Response({
+                    'status': False,
+                    'message': 'Username tidak ditemukan'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class FaceEnrollView(APIView):
     def post(self, request):
-        serializer = AttendanceCreateSerializer(
-            data=request.data, 
-            context={'request': request}
-        )
-        
-        if serializer.is_valid():
-            attendance = serializer.save()
-            
-            response_data = {
-                "success": True,
-                "message": "Absen berhasil",
-                "data": {
-                    "tanggal": attendance.tanggal.strftime('%Y-%m-%d'),
-                    "waktu": attendance.waktu.strftime('%H:%M:%S'),
-                    "status": attendance.status
-                }
-            }
-            
-            return Response(response_data, status=status.HTTP_201_CREATED)
-        else:
+        if request.user.role != 'mahasiswa':
             return Response({
-                "success": False,
-                "message": str(serializer.errors)
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-class AttendanceHistoryAPIView(APIView):
-    """Handle student attendance history"""
-    permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        nim = request.query_params.get('nim')
-        
-        if not nim:
-            return Response({
-                "success": False,
-                "message": "Parameter NIM diperlukan"
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Verify the requesting user has permission to view this history
-        if request.user.role == 'mahasiswa' and request.user.username != nim:
-            return Response({
-                "success": False,
-                "message": "Anda tidak memiliki akses untuk melihat riwayat absen mahasiswa lain"
+                'status': False,
+                'message': 'Hanya mahasiswa yang dapat enroll wajah'
             }, status=status.HTTP_403_FORBIDDEN)
-        
-        attendances = Attendance.objects.filter(nim=nim)
-        serializer = AttendanceHistorySerializer(attendances, many=True)
-        
-        return Response({
-            "success": True,
-            "data": serializer.data
-        }, status=status.HTTP_200_OK)
 
-class LecturerAttendanceAPIView(APIView):
-    """Handle lecturer attendance view"""
-    permission_classes = [IsAuthenticated]
-    
+        serializer = FaceEnrollSerializer(data=request.data)
+        if serializer.is_valid():
+            images = serializer.validated_data['images']
+
+            # Check if already enrolled
+            if FaceEmbedding.objects.filter(user=request.user).exists():
+                return Response({
+                    'status': False,
+                    'message': 'Wajah sudah terdaftar'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            embedding = enroll_with_multiple_images(images)
+            if embedding is None:
+                return Response({
+                    'status': False,
+                    'message': 'Gagal mendeteksi wajah pada gambar yang diupload'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            FaceEmbedding.objects.create(user=request.user, embedding=embedding)
+
+            return Response({
+                'status': True,
+                'message': 'Wajah berhasil didaftarkan',
+                'data': {
+                    'user_id': request.user.id,
+                    'images_used': len(images)
+                }
+            })
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class AttendanceHistoryView(APIView):
     def get(self, request):
-        # Only lecturers can access this endpoint
+        if request.user.role != 'mahasiswa':
+            return Response({
+                'status': False,
+                'message': 'Hanya mahasiswa yang dapat melihat histori absensi'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        attendances = Attendance.objects.filter(user=request.user).order_by('-timestamp')
+        serializer = AttendanceHistorySerializer(attendances, many=True)
+
+        return Response({
+            'status': True,
+            'message': 'Histori absensi',
+            'data': serializer.data
+        })
+
+class ClassCreateView(APIView):
+    def post(self, request):
         if request.user.role != 'dosen':
             return Response({
-                "success": False,
-                "message": "Akses ditolak. Hanya dosen yang dapat mengakses endpoint ini."
+                'status': False,
+                'message': 'Hanya dosen yang dapat membuat kelas'
             }, status=status.HTTP_403_FORBIDDEN)
-        
-        attendances = Attendance.objects.all()
-        serializer = LecturerAttendanceViewSerializer(attendances, many=True)
-        
+
+        serializer = ClassSerializer(data=request.data, context={'request': request})
+        if serializer.is_valid():
+            class_obj = serializer.save()
+            return Response({
+                'status': True,
+                'message': 'Kelas berhasil dibuat',
+                'data': serializer.data
+            }, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class ClassMyView(APIView):
+    def get(self, request):
+        if request.user.role == 'dosen':
+            # Dosen melihat semua kelas yang dibuatnya
+            classes = Class.objects.filter(lecturer=request.user)
+            message = 'Daftar kelas yang Anda buat'
+        else:
+            # Mahasiswa melihat semua kelas yang tersedia
+            classes = Class.objects.all()
+            message = 'Daftar kelas yang tersedia'
+
+        serializer = ClassListSerializer(classes, many=True)
+
         return Response({
-            "success": True,
-            "data": serializer.data
-        }, status=status.HTTP_200_OK)
+            'status': True,
+            'message': message,
+            'data': serializer.data
+        })
 
+class ClassListView(APIView):
+    def get(self, request):
+        if request.user.role == 'dosen':
+            classes = Class.objects.filter(lecturer=request.user)
+        else:
+            classes = Class.objects.all()
 
-class AIFaceValidationAPIView(APIView):
-    """Handle AI face validation for attendance"""
-    permission_classes = [AllowAny]
-    parser_classes = [MultiPartParser, FormParser]
-    
-    def post(self, request):
-        # Check if image file is provided
-        if 'foto' not in request.FILES:
+        serializer = ClassListSerializer(classes, many=True)
+
+        return Response({
+            'status': True,
+            'message': 'Daftar kelas',
+            'data': serializer.data
+        })
+
+class AttendanceRecapView(APIView):
+    def get(self, request, class_id):
+        if request.user.role != 'dosen':
             return Response({
-                "success": False,
-                "message": "File foto diperlukan",
-                "ai_result": None
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
-        image_file = request.FILES['foto']
-        
+                'status': False,
+                'message': 'Hanya dosen yang dapat melihat rekap absensi'
+            }, status=status.HTTP_403_FORBIDDEN)
+
         try:
-            # Read image from uploaded file
-            image_data = image_file.read()
-            
-            # Convert to PIL Image then to numpy array
-            pil_image = Image.open(io.BytesIO(image_data))
-            
-            # Convert to RGB if necessary
-            if pil_image.mode != 'RGB':
-                pil_image = pil_image.convert('RGB')
-            
-            # Convert PIL Image to numpy array (OpenCV format)
-            img_array = np.array(pil_image)
-            
-            # Convert RGB to BGR for OpenCV
-            img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-            
-            # Convert to grayscale for face detection
-            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            
-            # Load the pre-trained face cascade classifier
-            face_cascade = cv2.CascadeClassifier(
-                cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-            )
-            
-            # Detect faces in the image
-            faces = face_cascade.detectMultiScale(
-                gray,
-                scaleFactor=1.1,
-                minNeighbors=5,
-                minSize=(30, 30),
-                flags=cv2.CASCADE_SCALE_IMAGE
-            )
-            
-            # Calculate confidence based on face detection
-            if len(faces) == 0:
-                # No face detected
-                confidence = 0.0
-                is_valid = False
-            else:
-                # Face detected - calculate confidence based on face size and position
-                # Get the largest face (assumed to be the main subject)
-                largest_face = max(faces, key=lambda f: f[2] * f[3])
-                x, y, w, h = largest_face
-                
-                # Calculate confidence based on:
-                # 1. Face size relative to image (larger = better)
-                # 2. Face position (centered = better)
-                # 3. Number of faces detected (single face = better)
-                
-                img_height, img_width = gray.shape
-                face_area = w * h
-                image_area = img_width * img_height
-                
-                # Size score (0.0 to 0.4) - face should be at least 5% of image
-                size_ratio = face_area / image_area
-                size_score = min(size_ratio * 8, 0.4)  # Max 0.4
-                
-                # Position score (0.0 to 0.3) - face should be centered
-                face_center_x = x + w / 2
-                face_center_y = y + h / 2
-                center_x = img_width / 2
-                center_y = img_height / 2
-                
-                distance_from_center = np.sqrt(
-                    ((face_center_x - center_x) / img_width) ** 2 + 
-                    ((face_center_y - center_y) / img_height) ** 2
-                )
-                position_score = max(0.3 - distance_from_center, 0)
-                
-                # Single face bonus (0.0 to 0.3)
-                single_face_score = 0.3 if len(faces) == 1 else 0.15
-                
-                # Calculate final confidence
-                confidence = size_score + position_score + single_face_score
-                confidence = min(max(confidence, 0.0), 1.0)  # Clamp to 0-1
-                
-                # Round to 2 decimal places
-                confidence = round(confidence, 2)
-                
-                # Determine validity based on threshold
-                is_valid = confidence >= 0.7
-            
-            # Prepare response
-            if is_valid:
-                return Response({
-                    "success": True,
-                    "ai_result": {
-                        "status": "Valid",
-                        "confidence": confidence
-                    }
-                }, status=status.HTTP_200_OK)
-            else:
-                return Response({
-                    "success": False,
-                    "ai_result": {
-                        "status": "Tidak Valid",
-                        "confidence": confidence
-                    }
-                }, status=status.HTTP_200_OK)
-                
-        except Exception as e:
+            class_obj = Class.objects.get(id=class_id, lecturer=request.user)
+        except Class.DoesNotExist:
             return Response({
-                "success": False,
-                "message": f"Error processing image: {str(e)}",
-                "ai_result": None
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                'status': False,
+                'message': 'Kelas tidak ditemukan atau bukan milik Anda'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        attendances = Attendance.objects.filter(class_id=class_obj).select_related('user')
+        total_mahasiswa = User.objects.filter(role='mahasiswa').count()
+        total_hadir = attendances.count()
+
+        attendance_data = []
+        for attendance in attendances:
+            attendance_data.append({
+                'mahasiswa': UserSerializer(attendance.user).data,
+                'confidence': attendance.confidence,
+                'timestamp': attendance.timestamp
+            })
+
+        return Response({
+            'status': True,
+            'message': 'Rekap absensi kelas',
+            'data': {
+                'class': ClassListSerializer(class_obj).data,
+                'total_mahasiswa': total_mahasiswa,
+                'total_hadir': total_hadir,
+                'absensi': attendance_data
+            }
+        })
+
+class AttendanceCheckinView(APIView):
+    def post(self, request):
+        serializer = CheckinSerializer(data=request.data)
+        if serializer.is_valid():
+            image = serializer.validated_data['image']
+            class_id = serializer.validated_data['class_id']
+
+            try:
+                class_obj = Class.objects.get(id=class_id)
+            except Class.DoesNotExist:
+                return Response({
+                    'status': False,
+                    'message': 'Kelas tidak ditemukan'
+                }, status=status.HTTP_404_NOT_FOUND)
+
+            # Get user's embedding
+            try:
+                face_embedding = FaceEmbedding.objects.get(user=request.user)
+            except FaceEmbedding.DoesNotExist:
+                return Response({
+                    'status': False,
+                    'message': 'Wajah belum terdaftar'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Extract embedding from checkin image
+            checkin_emb = extract_embedding(image)
+            if checkin_emb is None:
+                return Response({
+                    'status': False,
+                    'message': 'Wajah tidak terdeteksi pada gambar check-in'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Verify
+            is_valid, confidence = verify_face(face_embedding.embedding, checkin_emb)
+
+            if is_valid:
+                Attendance.objects.create(
+                    user=request.user,
+                    class_id=class_obj,
+                    confidence=confidence
+                )
+                return Response({
+                    'status': True,
+                    'message': 'Absensi berhasil',
+                    'data': {
+                        'class_id': class_id,
+                        'confidence': round(confidence, 3)
+                    }
+                })
+            else:
+                return Response({
+                    'status': False,
+                    'message': 'Wajah tidak cocok',
+                    'data': {
+                        'confidence': round(confidence, 3)
+                    }
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

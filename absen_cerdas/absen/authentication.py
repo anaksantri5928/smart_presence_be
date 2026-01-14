@@ -1,51 +1,33 @@
-"""
-Custom authentication for token-based authentication
-"""
+import jwt
+from datetime import datetime, timedelta
+from django.conf import settings
+from django.contrib.auth import get_user_model
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import AuthenticationFailed
-from django.contrib.auth import get_user_model
-from django.utils import timezone
 
 User = get_user_model()
 
 class CustomTokenAuthentication(BaseAuthentication):
-    """
-    Custom token authentication that works with our User model token field
-    """
-    
     def authenticate(self, request):
-        # Get the Authorization header
-        auth_header = request.META.get('HTTP_AUTHORIZATION')
-        
-        if not auth_header:
-            return None  # No authentication provided
-            
-        # Check if it's a Bearer token
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return None
+
+        token = auth_header.split(' ')[1]
         try:
-            auth_type, token = auth_header.split(' ')
-            if auth_type.lower() != 'bearer':
-                return None  # Not a Bearer token
-        except ValueError:
-            return None  # Invalid header format
-            
-        if not token:
-            return None  # No token provided
-            
-        # Validate the token
-        try:
-            user = User.objects.get(token=token)
-            
-            # Check if token is still valid (optional: add expiration)
-            if hasattr(user, 'token_created') and user.token_created:
-                # Example: tokens expire after 24 hours
-                from datetime import timedelta
-                if timezone.now() - user.token_created > timedelta(hours=24):
-                    raise AuthenticationFailed('Token has expired')
-            
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=['HS256'])
+            user = User.objects.get(id=payload['user_id'])
             return (user, token)
-            
-        except User.DoesNotExist:
+        except (jwt.ExpiredSignatureError, jwt.DecodeError, User.DoesNotExist):
             raise AuthenticationFailed('Invalid token')
-    
-    def authenticate_header(self, request):
-        return 'Bearer realm="api"'
+
+def generate_token(user):
+    payload = {
+        'user_id': user.id,
+        'username': user.username,
+        'role': user.role,
+        'exp': datetime.utcnow() + timedelta(days=1),
+        'iat': datetime.utcnow(),
+    }
+    token = jwt.encode(payload, settings.SECRET_KEY, algorithm='HS256')
+    return token

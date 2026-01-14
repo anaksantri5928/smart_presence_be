@@ -1,16 +1,16 @@
 from django.urls import path
 from .views import (
-    LoginAPIView,
-    AttendanceAPIView,
-    AttendanceHistoryAPIView,
-    LecturerAttendanceAPIView,
-    AIFaceValidationAPIView
+    LoginView, FaceEnrollView, AttendanceCheckinView, AttendanceHistoryView,
+    ClassCreateView, ClassMyView, ClassListView, AttendanceRecapView
 )
 
 urlpatterns = [
-    path('login/', LoginAPIView.as_view(), name='login'),
-    path('absen/', AttendanceAPIView.as_view(), name='attendance'),
-    path('absen/riwayat/', AttendanceHistoryAPIView.as_view(), name='attendance_history'),
-    path('dosen/absen/', LecturerAttendanceAPIView.as_view(), name='lecturer_attendance'),
-    path('ai/validate/', AIFaceValidationAPIView.as_view(), name='ai_face_validation'),
+    path('auth/login', LoginView.as_view(), name='login'),
+    path('face/enroll', FaceEnrollView.as_view(), name='face_enroll'),
+    path('attendance/checkin', AttendanceCheckinView.as_view(), name='attendance_checkin'),
+    path('attendance/history', AttendanceHistoryView.as_view(), name='attendance_history'),
+    path('classes', ClassCreateView.as_view(), name='class_create'),
+    path('classes/my', ClassMyView.as_view(), name='class_my'),
+    path('classes/list', ClassListView.as_view(), name='class_list'),
+    path('attendance/recap/<int:class_id>', AttendanceRecapView.as_view(), name='attendance_recap'),
 ]
